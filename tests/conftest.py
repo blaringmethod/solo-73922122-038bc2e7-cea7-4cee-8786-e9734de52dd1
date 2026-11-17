@@ -34,6 +34,22 @@ SAMPLE = vcf([
 ])
 
 
+def bed(entries, chrom="chr1"):
+    """Build a BED body from (start, end, name) tuples (0-based half-open)."""
+    return "".join(f"{chrom}\t{s}\t{e}\t{n}\n" for s, e, n in entries)
+
+
+# chr1 genes (0-based half-open):
+#   GENE_A [89,103)  -> 1-based 90-103, intersects the deletion at 100-103
+#   GENE_B [104,115) -> 1-based 105-115, intersects 105 and 110
+#   GENE_C [199,204) -> 1-based 200-204, intersects the deletion at 200-204
+CATALOG = bed([
+    (89, 103, "GENE_A"),
+    (104, 115, "GENE_B"),
+    (199, 204, "GENE_C"),
+])
+
+
 def make_config(tmp_path, **kw):
     kw.setdefault("instance_id", "test-inst")
     kw.setdefault("reaper_interval", 0)    # deterministic: tests call reap_once()
@@ -59,4 +75,12 @@ def upload(client, body, base_version):
         "/vcf",
         params={"base_version": base_version},
         files={"file": ("variants.vcf", body if isinstance(body, bytes) else body.encode())},
+    )
+
+
+def upload_catalog(client, body, base_version):
+    return client.post(
+        "/catalog",
+        params={"base_version": base_version},
+        files={"file": ("genes.bed", body if isinstance(body, bytes) else body.encode())},
     )

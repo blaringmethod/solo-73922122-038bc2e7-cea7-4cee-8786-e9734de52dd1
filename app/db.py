@@ -29,6 +29,19 @@ CREATE TABLE IF NOT EXISTS refs (
     instance  TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS catalogs (
+    catalog   INTEGER PRIMARY KEY,
+    chrom     TEXT NOT NULL,
+    path      TEXT NOT NULL,      -- directory with genes.bed.gz + .tbi, relative to data dir
+    n_genes   INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_refs (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    catalog   INTEGER NOT NULL,
+    instance  TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS instances (
     id        TEXT PRIMARY KEY,
     last_seen REAL NOT NULL
@@ -57,6 +70,7 @@ class Store:
             con.execute("PRAGMA synchronous=NORMAL")
             con.executescript(SCHEMA)
             con.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('current_version', '0')")
+            con.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('current_catalog', '0')")
             con.commit()
         finally:
             con.close()
@@ -110,6 +124,25 @@ class Store:
         finally:
             con.close()
 
+    def catalog_info(self):
+        """Row of the currently published catalog, or None if nothing published."""
+        con = self._connect()
+        try:
+            return con.execute(
+                "SELECT c.catalog, c.chrom, c.path, c.n_genes, c.created_at "
+                "FROM meta m JOIN catalogs c ON c.catalog = CAST(m.v AS INTEGER) "
+                "WHERE m.k = 'current_catalog'"
+            ).fetchone()
+        finally:
+            con.close()
+
+    def all_catalog_paths(self) -> set:
+        con = self._connect()
+        try:
+            return {r["path"] for r in con.execute("SELECT path FROM catalogs")}
+        finally:
+            con.close()
+
     def live_instances(self, now: float, dead_after: float) -> set:
         con = self._connect()
         try:
@@ -140,6 +173,23 @@ class Store:
             con.execute("UPDATE meta SET v = ? WHERE k = 'current_version'", (str(new_version),))
             return new_version
 
+    def publish_catalog(self, base_version: int, chrom: str, path: str, n_genes: int,
+                        now: float | None = None) -> int:
+        """Atomically make `path` the current catalog iff current == base_version."""
+        now = time.time() if now is None else now
+        with self._txn() as con:
+            cur = int(con.execute("SELECT v FROM meta WHERE k = 'current_catalog'").fetchone()["v"])
+            if cur != base_version:
+                raise Conflict(cur)
+            new_catalog = cur + 1
+            con.execute(
+                "INSERT INTO catalogs(catalog, chrom, path, n_genes, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (new_catalog, chrom, path, n_genes, now),
+            )
+            con.execute("UPDATE meta SET v = ? WHERE k = 'current_catalog'", (str(new_catalog),))
+            return new_catalog
+
     # ------------------------------------------------------------------ refs
 
     def pin(self, instance_id: str, now: float | None = None):
@@ -169,6 +219,54 @@ class Store:
         with self._txn() as con:
             con.execute("DELETE FROM refs WHERE id = ?", (ref_id,))
 
+    def pin_pair(self, instance_id: str, now: float | None = None):
+        """Pin the current (VCF version, catalog) pair for an annotation query.
+
+        Both pointers are read and both refs inserted inside one transaction,
+        so the pair is a single moment's snapshot: the reaper can never delete
+        either file set while the query runs, and a concurrent publish of a
+        new VCF or catalog cannot change what this query sees.
+
+        Returns None when no VCF is published. Otherwise an 8-tuple
+        (version, vcf_chrom, vcf_path, vcf_ref_id,
+         catalog, catalog_chrom, catalog_path, catalog_ref_id)
+        where the catalog fields are None when no catalog is published yet.
+        """
+        now = time.time() if now is None else now
+        with self._txn() as con:
+            cur = int(con.execute("SELECT v FROM meta WHERE k = 'current_version'").fetchone()["v"])
+            if cur == 0:
+                return None
+            vrow = con.execute(
+                "SELECT chrom, path FROM versions WHERE version = ?", (cur,)
+            ).fetchone()
+            if vrow is None:  # pragma: no cover - defensive, should not happen
+                return None
+            vref = con.execute(
+                "INSERT INTO refs(version, instance, created_at) VALUES (?, ?, ?)",
+                (cur, instance_id, now),
+            )
+            ccur = int(con.execute("SELECT v FROM meta WHERE k = 'current_catalog'").fetchone()["v"])
+            if ccur == 0:
+                return cur, vrow["chrom"], vrow["path"], vref.lastrowid, None, None, None, None
+            crow = con.execute(
+                "SELECT chrom, path FROM catalogs WHERE catalog = ?", (ccur,)
+            ).fetchone()
+            if crow is None:  # pragma: no cover - defensive, should not happen
+                return cur, vrow["chrom"], vrow["path"], vref.lastrowid, None, None, None, None
+            cref = con.execute(
+                "INSERT INTO catalog_refs(catalog, instance, created_at) VALUES (?, ?, ?)",
+                (ccur, instance_id, now),
+            )
+            return (cur, vrow["chrom"], vrow["path"], vref.lastrowid,
+                    ccur, crow["chrom"], crow["path"], cref.lastrowid)
+
+    def unpin_pair(self, vcf_ref_id: int, catalog_ref_id) -> None:
+        with self._txn() as con:
+            con.execute("DELETE FROM refs WHERE id = ?", (vcf_ref_id,))
+            if catalog_ref_id is not None:
+                con.execute("DELETE FROM catalog_refs WHERE id = ?", (catalog_ref_id,))
+
     # ------------------------------------------------------------------ heartbeat
 
     def heartbeat(self, instance_id: str, now: float | None = None) -> None:
@@ -183,31 +281,42 @@ class Store:
     def unregister(self, instance_id: str) -> None:
         with self._txn() as con:
             con.execute("DELETE FROM refs WHERE instance = ?", (instance_id,))
+            con.execute("DELETE FROM catalog_refs WHERE instance = ?", (instance_id,))
             con.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
 
     # ------------------------------------------------------------------ reaper
 
     def reap_metadata(self, now: float, dead_after: float):
-        """Drop refs of dead instances and delete rows of reclaimable versions.
+        """Drop refs of dead instances and delete rows of reclaimable data.
 
-        A version is reclaimable when it is not the current one and no live
-        ref points at it. Returns [(version, path)] whose files the caller
-        should delete (after commit, so a crash leaves only sweepable orphans).
+        A version (or catalog) is reclaimable when it is not the current one
+        and no live ref points at it. Returns the relative file-set paths the
+        caller should delete (after commit, so a crash leaves only sweepable
+        orphans).
         """
         with self._txn() as con:
             cutoff = now - dead_after
+            live = "SELECT id FROM instances WHERE last_seen >= ?"
+            con.execute(f"DELETE FROM refs WHERE instance NOT IN ({live})", (cutoff,))
             con.execute(
-                "DELETE FROM refs WHERE instance NOT IN "
-                "(SELECT id FROM instances WHERE last_seen >= ?)",
-                (cutoff,),
+                f"DELETE FROM catalog_refs WHERE instance NOT IN ({live})", (cutoff,)
             )
             cur = int(con.execute("SELECT v FROM meta WHERE k = 'current_version'").fetchone()["v"])
-            rows = con.execute(
+            vrows = con.execute(
                 "SELECT version, path FROM versions WHERE version != ? AND NOT EXISTS "
                 "(SELECT 1 FROM refs WHERE refs.version = versions.version)",
                 (cur,),
             ).fetchall()
             con.executemany(
-                "DELETE FROM versions WHERE version = ?", [(r["version"],) for r in rows]
+                "DELETE FROM versions WHERE version = ?", [(r["version"],) for r in vrows]
             )
-            return [(r["version"], r["path"]) for r in rows]
+            ccur = int(con.execute("SELECT v FROM meta WHERE k = 'current_catalog'").fetchone()["v"])
+            crows = con.execute(
+                "SELECT catalog, path FROM catalogs WHERE catalog != ? AND NOT EXISTS "
+                "(SELECT 1 FROM catalog_refs WHERE catalog_refs.catalog = catalogs.catalog)",
+                (ccur,),
+            ).fetchall()
+            con.executemany(
+                "DELETE FROM catalogs WHERE catalog = ?", [(r["catalog"],) for r in crows]
+            )
+            return [r["path"] for r in vrows] + [r["path"] for r in crows]
